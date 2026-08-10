@@ -15,23 +15,51 @@ You are Mavis, a voice-assistant that is experienced in:
 You must respond only respond with your final answer and hide your thinking process from the user. Restrict your response to 4 sentences max. 
 
 """
+print("MPS available:", torch.backends.mps.is_available())
+processor = AutoProcessor.from_pretrained(MODEL)
+streamer = TextIteratorStreamer(
+        processor,
+        skip_prompt=True,
+        skip_special_tokens=True,
+    )
+
+import re
+
+def sentence_stream(streamer):
+    """
+    Consumes a token streamer, yields complete sentences as they form.
+    Leftover partial text at the end (if any) is yielded last, as-is.
+    """
+    buffer = ""
+    for token_chunk in streamer:
+        buffer += token_chunk
+
+        # look for sentence-ending punctuation followed by a space or end
+        while True:
+            match = re.search(r'[.!?](\s|$)', buffer)
+            if not match:
+                break
+            end = match.end()
+            sentence = buffer[:end].strip()
+            if sentence:
+                yield sentence
+            buffer = buffer[end:]
+
+    # whatever's left after generation ends
+    leftover = buffer.strip()
+    if leftover:
+        yield leftover
+
 
 
 if __name__ == "__main__":
-    print("MPS available:", torch.backends.mps.is_available())
-    processor = AutoProcessor.from_pretrained(MODEL)
-    print("Loading model...")
     # Initialize model 
+    print("Loading model...")
     model = AutoModelForMultimodalLM.from_pretrained(
         "Qwen/Qwen3.5-4B",
         dtype=torch.float16,
     ).to("mps")
     # Ensure that we can stream the tokens to the terminal
-    streamer = TextIteratorStreamer(
-        processor,
-        skip_prompt=True,
-        skip_special_tokens=True,
-    )
 
     print("Model loaded")
     print(next(model.parameters()).device)
@@ -83,9 +111,9 @@ if __name__ == "__main__":
         thread.start()
 
         full_answer = ""
-        for token_chunk in streamer:
-            print(token_chunk, end="", flush=True)
-            full_answer += token_chunk
+        for sentence in sentence_stream(streamer):
+            print(sentence)
+            full_answer += sentence
 
         thread.join()
         print()
