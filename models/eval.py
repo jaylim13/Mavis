@@ -1,5 +1,5 @@
 import re
-from threading import Lock, Thread
+from threading import Thread
 
 import torch
 from transformers import AutoModelForMultimodalLM, AutoProcessor, TextIteratorStreamer
@@ -15,9 +15,9 @@ You are Mavis, a voice-assistant that is experienced in:
 You must respond only respond with your final answer and hide your thinking process from the user. Restrict your response to 4 sentences max. 
 
 """
-generation_lock = Lock()
+
 conversation_history = []
-MAX_TURNS = 2
+MAX_TURNS = 6
 
 def flatten_turns(turns):
     lines = []
@@ -28,35 +28,34 @@ def flatten_turns(turns):
     return "\n".join(lines)
 
 def generate_reply(model, processor, messages, max_new_tokens):
-    with generation_lock:
-        inputs = processor.apply_chat_template(
-                    messages,
-                    add_generation_prompt=True,
-                    tokenize=True,
-                    return_dict=True,
-                    return_tensors="pt",
-                    enable_thinking=False,
-                )
-        
-        inputs = inputs.to(model.device)
+    inputs = processor.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+                enable_thinking=False,
+            )
+    
+    inputs = inputs.to(model.device)
 
-        generation_kwargs = dict(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            streamer=streamer,
-        )
+    generation_kwargs = dict(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        streamer=streamer,
+    )
 
-        thread = Thread(target=model.generate, kwargs=generation_kwargs)
-        thread.start()
+    thread = Thread(target=model.generate, kwargs=generation_kwargs)
+    thread.start()
 
-        full_answer = ""
-        for sentence in sentence_stream(streamer):
-            print(sentence)
-            full_answer += sentence + " "
+    full_answer = ""
+    for sentence in sentence_stream(streamer):
+        print(sentence)
+        full_answer += sentence + " "
 
-        thread.join()
-        print()
-        return full_answer
+    thread.join()
+    print()
+    return full_answer
 
 
 def sentence_stream(streamer):
@@ -174,6 +173,6 @@ if __name__ == "__main__":
         full_answer = generate_reply(model, processor, messages, max_new_tokens=256)
 
         add_turn("assistant", full_answer)
-        Thread(target=summarize_and_trim, args=(model, processor), daemon=True).start()
+        summarize_and_trim(model, processor)
 
         user_msg = input("Type something: ")
