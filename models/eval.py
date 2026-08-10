@@ -1,5 +1,6 @@
 import torch
 from transformers import AutoProcessor, AutoModelForMultimodalLM
+from transformers import TextStreamer
 
 MODEL = "Qwen/Qwen3.5-9B"
 
@@ -13,18 +14,18 @@ You must respond only respond with your final answer and hide your thinking proc
 
 """
 
-print("MPS available:", torch.backends.mps.is_available())
-
-processor = AutoProcessor.from_pretrained(MODEL)
-
-print("Loading model...")
-
 
 if __name__ == "__main__":
+    print("MPS available:", torch.backends.mps.is_available())
+    processor = AutoProcessor.from_pretrained(MODEL)
+    print("Loading model...")
+    # Initialize model 
     model = AutoModelForMultimodalLM.from_pretrained(
         "Qwen/Qwen3.5-4B",
         dtype=torch.float16,
     ).to("mps")
+    # Ensure that we can stream the tokens to the terminal
+    streamer = TextStreamer(processor, skip_prompt=True, skip_special_tokens=True)
 
     print("Model loaded")
     print(next(model.parameters()).device)
@@ -69,6 +70,7 @@ if __name__ == "__main__":
         outputs = model.generate(
             **inputs,
             max_new_tokens=40,
+            streamer=streamer,
         )
 
         answer = processor.decode(
