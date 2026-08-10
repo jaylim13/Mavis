@@ -1,6 +1,8 @@
 import torch
 from transformers import AutoProcessor, AutoModelForMultimodalLM
-from transformers import TextStreamer
+from transformers import TextIteratorStreamer
+from threading import Thread
+import re
 
 MODEL = "Qwen/Qwen3.5-9B"
 
@@ -25,7 +27,11 @@ if __name__ == "__main__":
         dtype=torch.float16,
     ).to("mps")
     # Ensure that we can stream the tokens to the terminal
-    streamer = TextStreamer(processor, skip_prompt=True, skip_special_tokens=True)
+    streamer = TextIteratorStreamer(
+        processor,
+        skip_prompt=True,
+        skip_special_tokens=True,
+    )
 
     print("Model loaded")
     print(next(model.parameters()).device)
@@ -67,16 +73,21 @@ if __name__ == "__main__":
 
         print("Starting generation...")
 
-        outputs = model.generate(
+        generation_kwargs = dict(
             **inputs,
-            max_new_tokens=40,
+            max_new_tokens=80,
             streamer=streamer,
         )
 
-        answer = processor.decode(
-            outputs[0][inputs["input_ids"].shape[-1]:],
-            skip_special_tokens=True,
-        )
+        thread = Thread(target=model.generate, kwargs=generation_kwargs)
+        thread.start()
 
-        print("Answer:", answer)
+        full_answer = ""
+        for token_chunk in streamer:
+            print(token_chunk, end="", flush=True)
+            full_answer += token_chunk
+
+        thread.join()
+        print()
+
         user_msg = input("Type something: ")
