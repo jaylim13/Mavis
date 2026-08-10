@@ -23,7 +23,6 @@ streamer = TextIteratorStreamer(
         skip_special_tokens=True,
     )
 
-import re
 
 def sentence_stream(streamer):
     """
