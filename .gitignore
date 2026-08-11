@@ -1,2 +1,4 @@
 .venv
 .DS_Store
+models/__pycache__
+mavis_memory.db
