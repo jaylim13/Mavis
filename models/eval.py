@@ -3,6 +3,8 @@ from threading import Thread
 
 import torch
 from transformers import AutoModelForMultimodalLM, AutoProcessor, TextIteratorStreamer
+from models.db import init_db, start_session, load_summary, save_summary, log_turn
+
 
 MODEL = "Qwen/Qwen3.5-4B"
 
@@ -13,11 +15,12 @@ Style Rules:
 * Eliminate filler, repetition, and casual slang.
 * Be proactive: anticipate needs, suggest alternatives, and challenge inefficient approaches by saying things like, "That approach is suboptimal, sir. I recommend..."
 * Use professional language combined with understated emotion, logic, and subtle dry wit.
+* Persist any information about the user when generating summaries of previous conversations. 
 
 """
 
 conversation_history = []
-MAX_TURNS = 5
+MAX_TURNS = 1
 
 def flatten_turns(turns):
     lines = []
@@ -27,7 +30,7 @@ def flatten_turns(turns):
         lines.append(f"{role}: {text}")
     return "\n".join(lines)
 
-def generate_reply(model, processor, messages, max_new_tokens):
+def generate_reply(model, processor, messages, max_new_tokens=256):
     inputs = processor.apply_chat_template(
                 messages,
                 add_generation_prompt=True,
@@ -91,13 +94,8 @@ def add_turn(role, text):
         "content": [{"type": "text", "text": text}]
     })
 
-    if len(conversation_history) > MAX_TURNS * 2:
-        conversation_history[:] = conversation_history[-MAX_TURNS*2: ]
-
 # long-term summary 
-running_summary = ""
-
-def summarize_and_trim(model, processor):
+def summarize_and_trim(model, processor, conn):
     global running_summary
     if len(conversation_history) <= MAX_TURNS * 2:
         return # trim unnecessary due to size constraints being met
@@ -120,9 +118,13 @@ def summarize_and_trim(model, processor):
     ]
 
     running_summary = generate_reply(model, processor, summary_prompt)
+    save_summary(conn, running_summary)
     
 
 if __name__ == "__main__":
+    conn = init_db()
+    session_id = start_session(conn)
+    running_summary = load_summary(conn)
     print("MPS available:", torch.backends.mps.is_available())
     processor = AutoProcessor.from_pretrained(MODEL)
     streamer = TextIteratorStreamer(
@@ -144,35 +146,26 @@ if __name__ == "__main__":
 
     while user_msg != "terminate":
         add_turn("user", user_msg)
+        log_turn(conn, session_id, "user", user_msg)
         # part 1: prompt 
+        system_text = SYSTEM_PROMPT
+        if running_summary: # part 2: Appenda additional context if there's a running summary
+            system_text += f"\n\nEarlier context: {running_summary}"
+
         messages = [
             {
                 "role": "system",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": SYSTEM_PROMPT
-                    }
-                ]
+                "content": [{"type": "text", "text": system_text}]
             },
         ]
-        # part 2: extended summary 
-        if running_summary:
-            messages.append({
-                "role": "system",
-                "content": [{
-                    "type": "text",
-                    "text": f"Earlier context: {running_summary}"
-                }]
-            })
-
 
         # part 3: precise short term buffer memory 
         messages += conversation_history
 
-        full_answer = generate_reply(model, processor, messages, max_new_tokens=256)
+        full_answer = generate_reply(model, processor, messages)
 
         add_turn("assistant", full_answer)
-        summarize_and_trim(model, processor)
+        log_turn(conn, session_id, "assistant", full_answer)
+        summarize_and_trim(model, processor, conn)
 
         user_msg = input("Type something: ")
