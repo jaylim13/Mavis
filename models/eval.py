@@ -6,6 +6,7 @@ import torch
 from transformers import AutoModelForMultimodalLM, AutoProcessor, TextIteratorStreamer
 
 from models.db import init_db, load_summary, log_turn, save_summary, start_session
+from models.stt import listen_and_transcribe
 
 MODEL = "Qwen/Qwen3.5-4B"
 
@@ -275,7 +276,8 @@ if __name__ == "__main__":
 
     print("Model loaded")
     print(next(model.parameters()).device)
-    user_msg = input("Type something: ")
+    user_msg = listen_and_transcribe()
+    print(f"You said: {user_msg}")
 
     while user_msg != "terminate":
         add_turn("user", user_msg)
