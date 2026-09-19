@@ -1,14 +1,11 @@
-import json
 import re
-from threading import Thread
 
-import torch
-from transformers import AutoModelForMultimodalLM, AutoProcessor, TextIteratorStreamer
+from mlx_lm import load, stream_generate
 
 from models.db import init_db, load_summary, log_turn, save_summary, start_session
 from models.stt import listen_and_transcribe
 
-MODEL = "Qwen/Qwen3.5-4B"
+MODEL = "mlx-community/Qwen3.5-4B-4bit"  # confirm exact repo name first
 
 SYSTEM_PROMPT = """
 You are M.A.V.I.S., an advanced and hyper-intelligent AI assistant. Address me as "sir". Maintain a calm, analytical, polite, and articulate demeanor with a subtle British cadence.
@@ -19,10 +16,16 @@ Style Rules:
 * Use professional language combined with understated emotion, logic, and subtle dry wit.
 * Persist any information about the user when generating summaries of previous conversations. 
 
-[TOOLS]: You have access to the tool save_memory_fact. Any time you encounter a specific durable fact about the user or user's intentions, projects, or goals, you must call the tool save_memory_fact to persist these facts into your long term memory database. You must only use this tool if such facts are provided in the user's input. Otherwise, do not make this tool call. 
+[TOOLS]: You have access to the tool save_memory_fact. Any time you encounter a specific durable fact about the user or user's intentions, projects, or goals, you must call the tool save_memory_fact to persist these facts into your long term memory database. You must only use this tool if such facts are provided in the user's input. Otherwise, do not make this tool call. Only call save_memory_fact when the fact is clear and unambiguous. 
+If the user's input is unclear or contains a typo you're unsure how 
+to interpret, respond normally without calling the tool.
 
-IMPORTANT: If you decide a tool call is necessary, you must
-begin with a short, natural spoken response to the user then call the tool. Never respond with a tool call alone.
+IMPORTANT: You must ALWAYS include a short spoken response to the user, 
+even when calling save_memory_fact. A tool call must never be your 
+entire response. For example, do NOT respond with only:
+<tool_call>...</tool_call>
+Instead, always say something first, such as "Noted, sir." or "I've 
+recorded that.", THEN include the tool call.
 
 """
 
@@ -74,48 +77,31 @@ def flatten_turns(turns):
     lines = []
     for turn in turns:
         role = turn["role"]
-        text = turn["content"][0]["text"]
+        text = turn["content"]
         lines.append(f"{role}: {text}")
     return "\n".join(lines)
 
-def generate_reply(model, processor, messages, conn, max_new_tokens=256):
-    streamer = TextIteratorStreamer(
-        processor,
-        skip_prompt=True,
-        skip_special_tokens=True,
-    )
-    inputs = processor.apply_chat_template(
+def generate_reply(model, tokenizer, messages, conn, max_tokens=256):
+
+    prompt = tokenizer.apply_chat_template(
         messages,
         tools=[MEMORY_TOOL],
         add_generation_prompt=True,
-        tokenize=True,
-        return_dict=True,
-        return_tensors="pt",
-        enable_thinking=False,
+        enable_thinking=False
     )
-    
-    inputs = inputs.to(model.device)
-
-    generation_kwargs = dict(
-        **inputs,
-        max_new_tokens=max_new_tokens,
-        streamer=streamer,
-    )
-
-    thread = Thread(target=model.generate, kwargs=generation_kwargs)
-    thread.start()
 
     full_answer = ""
-    pending_tool_calls = []   # ← collect instead of dispatching immediately
+    pending_tool_calls = []
 
-    for kind, payload in stream_and_dispatch(streamer):
+    token_stream = (r.text for r in stream_generate(model, tokenizer, prompt, max_tokens=max_tokens))
+
+    for kind, payload in stream_and_dispatch(token_stream):
         if kind == "sentence":
             print(payload)
             full_answer += payload + " "
         elif kind == "tool_call":
-            pending_tool_calls.append(payload)   # defer
+            pending_tool_calls.append(payload)
 
-    thread.join()
     print()
 
     # now that generation is fully done, execute tool calls silently
@@ -124,33 +110,18 @@ def generate_reply(model, processor, messages, conn, max_new_tokens=256):
             fact = call["arguments"]["fact"]
             save_memory_fact(conn, fact)
 
+    # fallback: never let a turn end in total silence
+    if not full_answer.strip() and pending_tool_calls:
+        full_answer = "Noted, sir."
+        print(full_answer)
+
     return full_answer
 
-def generate_summary(model, processor, prompt):
-    inputs = processor.apply_chat_template(
-        prompt,
-        add_generation_prompt=True,
-        tokenize=True,
-        return_dict=True,
-        return_tensors="pt",
-        enable_thinking=False,
-    )
 
-    inputs = inputs.to(model.device)
-
-    with torch.inference_mode():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=150,
-            do_sample=False,
-        )
-
-    answer = processor.decode(
-        outputs[0][inputs["input_ids"].shape[-1]:],
-        skip_special_tokens=True,
-    )
-
-    return answer.strip()
+def generate_summary(model, tokenizer, prompt):
+    formatted = tokenizer.apply_chat_template(prompt, add_generation_prompt=True, enable_thinking=False)
+    result = "".join(r.text for r in stream_generate(model, tokenizer, formatted, max_tokens=256))
+    return result.strip()
 
 
 def stream_and_dispatch(streamer):
@@ -213,11 +184,11 @@ def stream_and_dispatch(streamer):
 def add_turn(role, text):
     conversation_history.append({
         "role": role,
-        "content": [{"type": "text", "text": text}]
+        "content": text
     })
 
 # long-term summary 
-def summarize_and_trim(model, processor, conn):
+def summarize_and_trim(model, tokenizer, conn):
     global running_summary
     if len(conversation_history) <= MAX_TURNS * 2:
         return # trim unnecessary due to size constraints being met
@@ -227,9 +198,7 @@ def summarize_and_trim(model, processor, conn):
     summary_prompt = [
         {
             "role": "user",
-            "content": [{
-                "type": "text",
-                "text": (
+            "content": (
                     "You maintain M.A.V.I.S.'s persistent memory of the user.\n\n"
                     f"EXISTING MEMORY:\n{running_summary or '(none)'}\n\n"
                     f"NEW CONVERSATION:\n{flatten_turns(to_summarize)}\n\n"
@@ -243,11 +212,10 @@ def summarize_and_trim(model, processor, conn):
                     "Ignore casual conversation and temporary details.\n"
                     "Return only the updated memory summary."
                 )
-            }]
         }
     ]
 
-    running_summary = generate_summary(model, processor, summary_prompt)
+    running_summary = generate_summary(model, tokenizer, summary_prompt)
     save_summary(conn, running_summary)
 
 
@@ -264,19 +232,11 @@ if __name__ == "__main__":
     conn = init_db()
     session_id = start_session(conn)
     running_summary = load_summary(conn)
-    print("MPS available:", torch.backends.mps.is_available())
-    processor = AutoProcessor.from_pretrained(MODEL)
-    # Initialize model 
     print("Loading model...")
-    model = AutoModelForMultimodalLM.from_pretrained(
-        MODEL,
-        dtype=torch.float16,
-    ).to("mps")
-    # Ensure that we can stream the tokens to the terminal
-
+    model, tokenizer = load(MODEL)
     print("Model loaded")
-    print(next(model.parameters()).device)
-    user_msg = listen_and_transcribe()
+    # user_msg = listen_and_transcribe()
+    user_msg = input("Type something: ")
     print(f"You said: {user_msg}")
 
     while user_msg != "terminate":
@@ -294,18 +254,18 @@ if __name__ == "__main__":
         messages = [
             {
                 "role": "system",
-                "content": [{"type": "text", "text": system_text}]
+                "content": system_text
             },
         ]
 
         # part 3: precise short term buffer memory 
         messages += conversation_history
-
-        full_answer = generate_reply(model, processor, messages, conn)
+        
+        full_answer = generate_reply(model, tokenizer, messages, conn)
 
         add_turn("assistant", full_answer)
         log_turn(conn, session_id, "assistant", full_answer)
-        summarize_and_trim(model, processor, conn)
+        summarize_and_trim(model, tokenizer, conn)
 
         user_msg = input("Type something: ")
 
